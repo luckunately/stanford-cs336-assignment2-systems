@@ -133,6 +133,7 @@ def flash_fwd_kernel(
     lse = tl.log(lse) + max_per_row
     tl.store(L_block_ptr, lse, boundary_check=(0,))
 
+@torch.compile
 class FlashAttentionFunctionTriton(torch.autograd.Function):
     @staticmethod
     def forward(ctx, Q, K, V, is_causal=False) -> Tensor:
@@ -187,10 +188,34 @@ class FlashAttentionFunctionTriton(torch.autograd.Function):
             tile_num,
             is_causal
         )
-        ctx.save_for_backward(L)
+        ctx.save_for_backward(L, Q, K, V, torch.tensor(is_causal))
         return O
 
+    @staticmethod
+    def backward(ctx, dO):
+        L, Q, K, V, is_causal = ctx.saved_tensors
+        head_dim = Q.shape[-1]
+        sqrt_d = math.sqrt(head_dim)
+        
+        # Compute gradients
+        S = einsum(Q, K, '... q d, ... k d -> ... q k') / sqrt_d
+        if is_causal == torch.tensor(True):
+            q_indices = torch.arange(Q.shape[1], device=Q.device)[None, :, None]
+            k_indices = torch.arange(K.shape[1], device=K.device)[None, None, :]
+            mask = q_indices >= k_indices
+            S = torch.where(mask, S, float("-inf"))
+        
+        P = torch.exp(S - L[:, :, None])
+        dV = einsum(dO, P, '... q d, ... q k -> ... k d')
+        
+        dP = einsum(dO, V, '... q d, ... k d -> ... q k')
+        D = einsum(P, dP, '... q k, ... q k -> ... q k').sum(dim=-1)
+        dS = einsum(P, (dP - D[..., None]), '... q k, ... q k -> ... q k')
+        dQ = einsum(dS, K, '... q k, ... k d -> ... q d') / sqrt_d
+        dK = einsum(dS, Q, '... q k, ... q d -> ... k d') / sqrt_d
+        return dQ, dK, dV, None
 
+@torch.compile
 class FlashAttentionFunctionPytorch(torch.autograd.Function):
     # No constructor (__init__) is needed for torch.autograd.Function subclasses.
     # All state should be managed via the context (ctx) in forward/backward.
@@ -290,24 +315,32 @@ class FlashAttentionFunctionPytorch(torch.autograd.Function):
                 torch.log(lse) + max_per_row
             ).to(L.device)
 
-        ctx.save_for_backward(L)
+        ctx.save_for_backward(L, Q, K, V, torch.tensor(is_causal))
         return O
 
     @staticmethod
-    def backward(ctx, grad_output):
-        """
-        Args:
-            ctx (torch.autograd.FunctionContext): Context with saved information from forward pass
-            grad_output (Tensor): Gradient tensor from the output of the forward pass
-        """
-        raise NotImplementedError("Backward pass is not implemented.")
-        # Q, K, V = ctx.saved_tensors
-        # is_causal = ctx.is_causal
-
-        # # Compute gradients
-        # grad_Q, grad_K, grad_V = Flashattention_Autograd_Function_Pytorch.backward_impl(Q, K, V, grad_output, is_causal)
-
-        # return grad_Q, grad_K, grad_V
+    def backward(ctx, dO):
+        L, Q, K, V, is_causal = ctx.saved_tensors
+        head_dim = Q.shape[-1]
+        sqrt_d = math.sqrt(head_dim)
+        
+        # Compute gradients
+        S = einsum(Q, K, '... q d, ... k d -> ... q k') / sqrt_d
+        if is_causal == torch.tensor(True):
+            q_indices = torch.arange(Q.shape[1], device=Q.device)[None, :, None]
+            k_indices = torch.arange(K.shape[1], device=K.device)[None, None, :]
+            mask = q_indices >= k_indices
+            S = torch.where(mask, S, float("-inf"))
+        
+        P = torch.exp(S - L[:, :, None])
+        dV = einsum(dO, P, '... q d, ... q k -> ... k d')
+        
+        dP = einsum(dO, V, '... q d, ... k d -> ... q k')
+        D = einsum(P, dP, '... q k, ... q k -> ... q k').sum(dim=-1)
+        dS = einsum(P, (dP - D[..., None]), '... q k, ... q k -> ... q k')
+        dQ = einsum(dS, K, '... q k, ... k d -> ... q d') / sqrt_d
+        dK = einsum(dS, Q, '... q k, ... q d -> ... k d') / sqrt_d
+        return dQ, dK, dV, None
 
 
 @staticmethod
