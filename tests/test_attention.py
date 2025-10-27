@@ -52,7 +52,9 @@ def _test_flash_forward_pass(impl, device="cpu", is_causal=False):
     l = maybe_ls[0]
 
     o_ref, l_ref = _attention_and_lse(q, k, v, is_causal)
-
+    
+    assert o.shape == o_ref.shape, f"Output shape mismatch: got {o.shape}, expected {o_ref.shape}"
+    assert l.shape == l_ref.shape, f"L shape mismatch: got {l.shape}, expected {l_ref.shape}"
     torch.testing.assert_close(o, o_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(l, l_ref, rtol=1e-2, atol=1e-2)
 
@@ -65,8 +67,7 @@ def test_flash_forward_pass_pytorch():
     not torch.cuda.is_available(),
     reason="A GPU must be available to run Triton kernels",
 )
-# @pytest.mark.parametrize("is_causal", [False, True])
-@pytest.mark.parametrize("is_causal", [False])
+@pytest.mark.parametrize("is_causal", [False, True])
 def test_flash_forward_pass_triton(is_causal):
     _test_flash_forward_pass(get_flashattention_autograd_function_triton().apply, device="cuda", is_causal=is_causal)
 
